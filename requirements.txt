@@ -1,0 +1,4 @@
+requests>=2.31
+holidays>=0.45
+rapidfuzz>=3.6
+openpyxl>=3.1
