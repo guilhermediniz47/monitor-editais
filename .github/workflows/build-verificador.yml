@@ -1,0 +1,49 @@
+# ============================================================
+#  Build do VerificadorPNCP.exe NA NUVEM (sem Python na sua maquina)
+# ============================================================
+# Como usar:
+#   1) No SEU repositorio do GitHub (o mesmo do monitor), envie o arquivo:
+#        - verifica_publicacao_pncp.py
+#      e coloque ESTE arquivo em:  .github/workflows/build-verificador.yml
+#   2) Na aba "Actions", rode o workflow "Build Verificador EXE".
+#   3) Baixe o artefato "VerificadorPNCP-Windows" -> contem o .exe.
+#
+# Observacao: este verificador NAO precisa de planilha de entrada. Ele
+# baixa sozinho a lista dos 399 municipios do PR (API do IBGE) e gera a
+# planilha 'publicacao_pncp_2026.xlsx' na pasta onde o .exe for executado.
+# ============================================================
+
+name: Build Verificador EXE
+
+on:
+  workflow_dispatch:        # botao "Run workflow" na aba Actions
+  push:
+    branches: [ main, master ]
+    paths: [ "verifica_publicacao_pncp.py" ]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Baixar o codigo
+        uses: actions/checkout@v4
+
+      - name: Instalar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests openpyxl pyinstaller
+
+      - name: Compilar o executavel
+        run: |
+          pyinstaller --onefile --console --name VerificadorPNCP verifica_publicacao_pncp.py
+
+      - name: Publicar o artefato (.exe)
+        uses: actions/upload-artifact@v4
+        with:
+          name: VerificadorPNCP-Windows
+          path: dist/VerificadorPNCP.exe
