@@ -1,0 +1,68 @@
+# ============================================================
+#  MONITOR AGENDADO NA NUVEM (gratis) - GitHub Actions
+#  Roda toda TERCA e SEXTA as 03h00 de Curitiba (madrugada).
+# ============================================================
+# Como instalar:
+#   1) No SEU repositorio (o mesmo do monitor), garanta que estao la:
+#        - monitor_editais_pncp.py
+#        - watchlist_editais.xlsx   (preenchida)
+#   2) Coloque ESTE arquivo em:  .github/workflows/monitor-agendado.yml
+#   3) Pronto: o GitHub roda sozinho nos horarios agendados.
+#      A planilha de resultados fica em "Artifacts" de cada execucao.
+#
+# Fuso: o cron do GitHub e em UTC. Curitiba = UTC-3, entao
+#       03h00 BRT  ==  06h00 UTC.  Terca=2, Sexta=5.
+#
+# (OPCIONAL) Alertas no Teams em vez de planilha:
+#   Em Settings > Secrets and variables > Actions, crie os secrets
+#   TEAMS_WEBHOOK_INFRA e TEAMS_WEBHOOK_EDIF com as URLs do Workflows.
+#   Se existirem, o programa envia ao Teams; senao, gera a planilha.
+# ============================================================
+
+name: Monitor Editais (agendado)
+
+on:
+  schedule:
+    - cron: "0 6 * * 2,5"     # 06:00 UTC = 03:00 BRT, terca (2) e sexta (5)
+  workflow_dispatch:           # permite rodar manualmente pelo botao tambem
+
+# Evita execucoes sobrepostas
+concurrency:
+  group: monitor-editais
+  cancel-in-progress: false
+
+jobs:
+  rodar-monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Baixar o codigo e a planilha
+        uses: actions/checkout@v4
+
+      - name: Instalar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests openpyxl rapidfuzz holidays
+
+      - name: Rodar o monitor
+        env:
+          # Se voce cadastrar os secrets, o programa envia ao Teams.
+          # Se nao existirem, ficam vazios e o programa gera a planilha.
+          TEAMS_WEBHOOK_INFRA: ${{ secrets.TEAMS_WEBHOOK_INFRA }}
+          TEAMS_WEBHOOK_EDIF:  ${{ secrets.TEAMS_WEBHOOK_EDIF }}
+        run: |
+          python monitor_editais_pncp.py run
+
+      - name: Publicar a planilha de resultados (Artifacts)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resultado-${{ github.run_id }}
+          path: saida_licitacoes_*.xlsx
+          if-no-files-found: ignore
+          retention-days: 90
