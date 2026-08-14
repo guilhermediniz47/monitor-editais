@@ -1,37 +1,38 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-monitor_editais_pncp.py  (v8 - sem banco local; saida = planilha)
+monitor_editais_pncp.py  (v10 - precedencia Objeto->Valor->Suspensa->Revogada)
 ======================================================================
-Monitor de editais do PNCP (UF=PR).
+Monitor de editais do PNCP (UF=PR). Modelo de BUSCA DIRETA.
 
-LOGICA (BUSCA DIRETA): voce cadastra na planilha a licitacao-alvo
-  (MUNICIPIO, CODIGO IBGE, OBJETO, VALOR). A cada execucao o agente
-  consulta o PNCP e sinaliza contratacao com:
-       MESMO MUNICIPIO  E  ( OBJETO similar  OU  VALOR proximo )
-  cabendo ao auditor avaliar retomada/republicacao x falso positivo.
+Voce cadastra na planilha a licitacao-alvo (MUNICIPIO, IBGE, OBJETO,
+VALOR). A cada execucao o agente consulta o PNCP (ultimos 7 dias) e
+CLASSIFICA cada contratacao do MESMO MUNICIPIO em abas.
 
-SAIDA:
-  - Se existir webhook do Teams (env/arquivo)  -> envia ao TEAMS.
-  - Caso contrario -> gera PLANILHA de saida (.xlsx) com as licitacoes
-    que deram match, para o auditor analisar. Colunas:
-    Municipio | Objeto | Valor | Id da Contratacao (+ apoio).
+  CRITERIO DE ALERTA:
+     mesmo MUNICIPIO  E  objeto >= 50%  E  valor +-20%
+     (e a contratacao NAO estar suspensa/revogada)
 
-v8: NAO cria mais banco local (editais_pncp.db). Cada execucao e
-    independente e produz uma planilha com os candidatos atuais.
+  PRECEDENCIA DE CLASSIFICACAO (definida pelo usuario):
+     Objeto(<50%) -> Valor(fora +-20%) -> Suspensa -> Revogada -> Alertas
+  Assim, D_Suspenso e D_Revogado contem apenas itens que JA sao
+  relevantes (passaram objeto e valor); um edital monitorado que
+  aparece suspenso/revogado NAO vai para Alertas.
 
-Planilha 'watchlist_editais.xlsx' (aba 'Editais'):
+  Abas SEMPRE geradas na planilha de saida:
+    - "Alertas"    : objeto >= 50% E valor +-20% E ativa -> avaliar
+    - "D_Suspenso" : passou objeto+valor, mas status SUSPENSA
+    - "D_Revogado" : passou objeto+valor, mas status REVOGADA/ANULADA
+    - "D_Objeto"   : mesmo municipio, objeto < 50%
+    - "D_Valor"    : mesmo municipio, objeto >= 50%, mas valor fora +-20%
+
+Saida:
+  - SEMPRE gera 'saida_licitacoes_AAAAMMDD_HHMMSS.xlsx' (5 abas).
+  - Se houver webhook do Teams, tambem envia os itens da aba Alertas.
+
+Planilha de entrada 'watchlist_editais.xlsx' (aba 'Editais'):
   A Ente(Nome Municipio) | B Codigo IBGE | C Objeto | D Valor |
   E Gerencia | F Observacoes
-
-Robustez: consulta direta por municipio (codigoMunicipioIbge); timeout
-60s; aviso "PNCP instavel, aguarde..."; retry/backoff em 429/5xx/timeout.
-
-Conformidade API (Swagger pncp.gov.br/api/consulta/v3/api-docs):
-  Base https://pncp.gov.br/api/consulta ; GET /v1/contratacoes/publicacao
-  e /v1/contratacoes/atualizacao ; datas yyyyMMdd ;
-  codigoModalidadeContratacao (OBRIGATORIO) ; uf ; codigoMunicipioIbge ;
-  pagina (OBRIGATORIO) ; tamanhoPagina MAXIMO 50.
 ======================================================================
 """
 
@@ -74,7 +75,7 @@ except ImportError:
 
 
 # ======================================================================
-# LOCALIZACAO DOS ARQUIVOS (funciona como .py e como .exe do PyInstaller)
+# LOCALIZACAO DOS ARQUIVOS
 # ======================================================================
 if getattr(sys, "frozen", False):
     BASE_DIR = os.path.dirname(sys.executable)
@@ -120,9 +121,14 @@ HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 #   4 Concorrencia Elet. | 5 Concorrencia Pres. | 8 Dispensa | 9 Inexig.
 MODALIDADES_OBRAS = [4, 5, 8, 9]
 
-LIMIAR_OBJETO = 0.70
-TOLERANCIA_VALOR = 0.20
+# ---- CRITERIOS ----
+LIMIAR_OBJETO = 0.50       # objeto similar quando >= 50%
+TOLERANCIA_VALOR = 0.20    # valor dentro de +-20%
 SIM_MUNICIPIO = 0.90
+
+# Palavras que indicam situacao de descarte
+SIT_SUSPENSA  = ("suspens",)
+SIT_REVOGADA  = ("revog", "anulad")
 
 XLSX = os.environ.get("WATCHLIST_XLSX",
                       os.path.join(BASE_DIR, "watchlist_editais.xlsx"))
@@ -345,7 +351,7 @@ def extrai(item):
 
 
 # ======================================================================
-# MATCH DIRETO: municipio E (objeto OU valor)
+# MATCH / CLASSIFICACAO
 # ======================================================================
 def municipio_bate(watch, c):
     wi, ci = so_digitos(watch.get("ibge")), so_digitos(c.get("ibge"))
@@ -359,128 +365,123 @@ def municipio_bate(watch, c):
 
 
 def valor_bate(watch, c):
+    """True se dentro de +-20%; False se fora; None se algum valor ausente."""
     vw, vc = watch.get("valor"), c.get("valor")
     if not vw or not vc:
         return None
     return abs(vw - vc) / max(vw, vc) <= TOLERANCIA_VALOR
 
 
-def avalia(watch, c):
-    if not municipio_bate(watch, c):
-        return False, 0.0, None, ""
+def _tem(sit, chaves):
+    s = (sit or "").lower()
+    return any(k in s for k in chaves)
+
+
+def classifica(watch, c):
+    """Para um par (alvo, contratacao) do MESMO municipio, devolve
+    (bucket, s_obj, vflag).
+    PRECEDENCIA (usuario): Objeto -> Valor -> Suspensa -> Revogada -> Alertas.
+      1) objeto < 50%              -> D_Objeto
+      2) valor fora de +-20%       -> D_Valor
+      3) status suspensa           -> D_Suspenso
+      4) status revogada/anulada   -> D_Revogado
+      5) caso contrario            -> Alertas
+    (itens em D_Suspenso/D_Revogado ja passaram objeto+valor => relevantes)"""
     s_obj = obj_sim(normaliza(watch["objeto"]), normaliza(c["objeto"]))
     vflag = valor_bate(watch, c)
-    obj_ok = s_obj >= LIMIAR_OBJETO
-    val_ok = (vflag is True)
-    if obj_ok and val_ok:
-        return True, s_obj, vflag, "objeto+valor"
-    if obj_ok:
-        return True, s_obj, vflag, "objeto"
-    if val_ok:
-        return True, s_obj, vflag, "valor"
-    return False, s_obj, vflag, ""
+    if s_obj < LIMIAR_OBJETO:
+        return "D_Objeto", s_obj, vflag
+    if vflag is False:                 # valor conhecido e fora de +-20%
+        return "D_Valor", s_obj, vflag
+    if _tem(c["situacao"], SIT_SUSPENSA):
+        return "D_Suspenso", s_obj, vflag
+    if _tem(c["situacao"], SIT_REVOGADA):
+        return "D_Revogado", s_obj, vflag
+    return "Alertas", s_obj, vflag     # objeto>=50%, valor OK (ou n/d), ativa
 
 
-def detecta(registros, watchlist):
-    """Sem banco: coleta os matches da execucao atual (dedup por
-    (linha, id_pncp) para nao repetir quando o mesmo edital vem de
-    /publicacao e /atualizacao)."""
-    alertas, vistos = [], set()
+BUCKETS = ["Alertas", "D_Suspenso", "D_Revogado", "D_Objeto", "D_Valor"]
+
+
+def classifica_tudo(registros, watchlist):
+    """Devolve dict bucket -> lista de linhas (dict), com dedup por
+    (linha_alvo, id_pncp) dentro de cada bucket."""
+    saida = {b: [] for b in BUCKETS}
+    vistos = {b: set() for b in BUCKETS}
     for item in registros:
         c = extrai(item)
         if not c["id_pncp"] or (c.get("uf") not in (UF_ALVO, None)):
             continue
         for w in watchlist:
-            ok, s_obj, vflag, motivo = avalia(w, c)
-            if not ok:
-                continue
-            chave = (w["id"], c["id_pncp"])
-            if chave in vistos:
-                continue
-            vistos.add(chave)
-            obs_val = ("valor n/d" if vflag is None
-                       else (f"valor +-{int(TOLERANCIA_VALOR*100)}% OK" if vflag
-                             else "valor fora"))
-            det = (f"MATCH[{motivo}] linha {w['id']} | {c['orgao']} "
-                   f"({c['municipio']}) | obj={s_obj:.0%} | "
-                   f"R$ {c['valor']:,.2f} ({obs_val}) | "
-                   f"situacao='{c['situacao']}' | {c['id_pncp']}")
-            alertas.append(dict(w=w, c=c, s_obj=s_obj, vflag=vflag,
-                                motivo=motivo, det=det))
-    return alertas
-
-
-# ======================================================================
-# DIAGNOSTICO
-# ======================================================================
-def relatorio_watchlist(watchlist, registros):
-    print("\n----- DIAGNOSTICO: situacao por edital vigiado -----")
-    print("  [OK]=municipio E (objeto OU valor) | [~?]=municipio, mas nem "
-          "objeto nem valor | [X]=municipio ausente na coleta")
-    for w in watchlist:
-        alvo = w["municipio"] or w["ibge"] or "?"
-        achou_muni = False
-        match_c, match_obj, match_motivo = None, 0.0, ""
-        best_obj = 0.0
-        for item in registros:
-            c = extrai(item)
-            if c.get("uf") not in (UF_ALVO, None):
-                continue
             if not municipio_bate(w, c):
                 continue
-            achou_muni = True
-            ok, s_obj, vflag, motivo = avalia(w, c)
-            if s_obj > best_obj:
-                best_obj = s_obj
-            if ok and s_obj >= match_obj:
-                match_c, match_obj, match_motivo = c, s_obj, motivo
-        if match_c:
-            print(f"  [OK] linha {w['id']} ({alvo}): disparo por {match_motivo} "
-                  f"| obj={match_obj:.0%} | situacao='{match_c['situacao']}' "
-                  f"| {match_c['id_pncp']}")
-        elif achou_muni:
-            print(f"  [~?] linha {w['id']} ({alvo}): ha edital(is) do municipio, "
-                  f"mas nem objeto (melhor {best_obj:.0%}) nem valor bateram")
-        else:
-            print(f"  [X ] linha {w['id']} ({alvo}): nenhum edital deste "
-                  f"municipio na coleta (verifique o codigo IBGE / janela)")
-    print("----------------------------------------------------")
+            bucket, s_obj, vflag = classifica(w, c)
+            chave = (w["id"], c["id_pncp"])
+            if chave in vistos[bucket]:
+                continue
+            vistos[bucket].add(chave)
+            if vflag is None:
+                obs = "valor nao informado - conferir"
+            elif vflag:
+                obs = f"valor dentro de +-{int(TOLERANCIA_VALOR*100)}%"
+            else:
+                vw = w.get("valor") or 0
+                vc = c.get("valor") or 0
+                dif = (abs(vw - vc) / max(vw, vc) * 100) if max(vw, vc) else 0
+                obs = f"valor fora ({dif:.0f}% de diferenca)"
+            saida[bucket].append({
+                "municipio": c["municipio"], "objeto": c["objeto"],
+                "valor": c["valor"], "id_pncp": c["id_pncp"],
+                "linha": w["id"], "gerencia": w["gerencia"],
+                "s_obj": s_obj, "situacao": c["situacao"], "obs": obs,
+            })
+    return saida
 
 
 # ======================================================================
-# PLANILHA DE SAIDA
+# PLANILHA DE SAIDA (sempre, com as 5 abas)
 # ======================================================================
-def gera_planilha_saida(alertas):
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Licitacoes mapeadas"
+_COR_ABA = {
+    "Alertas": "1F4E78", "D_Suspenso": "BF8F00", "D_Revogado": "C00000",
+    "D_Objeto": "808080", "D_Valor": "7030A0",
+}
+
+
+def _monta_aba(ws, linhas):
     headers = ["Municipio", "Objeto", "Valor (R$)", "Id da Contratacao",
-               "Alvo (linha)", "Disparo por", "Similaridade objeto",
-               "Situacao", "Link PNCP"]
+               "Alvo (linha)", "Gerencia", "Similaridade objeto",
+               "Situacao", "Observacao", "Link PNCP"]
     ws.append(headers)
+    cor = _COR_ABA.get(ws.title, "1F4E78")
     for col in range(1, len(headers) + 1):
         cell = ws.cell(row=1, column=col)
         cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill("solid", fgColor="1F4E78")
+        cell.fill = PatternFill("solid", fgColor=cor)
         cell.alignment = Alignment(horizontal="center", vertical="center",
                                    wrap_text=True)
-    mot_map = {"objeto+valor": "objeto E valor", "objeto": "objeto similar",
-               "valor": "valor proximo"}
-    for a in alertas:
-        c = a["c"]
-        link = f"https://pncp.gov.br/app/editais/{c.get('id_pncp','')}"
-        ws.append([c.get("municipio"), c.get("objeto"), c.get("valor", 0.0),
-                   c.get("id_pncp"), a["w"]["id"],
-                   mot_map.get(a["motivo"], a["motivo"]),
-                   f"{a['s_obj']:.0%}", c.get("situacao"), link])
-    widths = [20, 60, 16, 34, 11, 15, 18, 22, 42]
+    for r in linhas:
+        link = f"https://pncp.gov.br/app/editais/{r['id_pncp']}"
+        ws.append([r["municipio"], r["objeto"], r["valor"], r["id_pncp"],
+                   r["linha"], r["gerencia"], f"{r['s_obj']:.0%}",
+                   r["situacao"], r["obs"], link])
+    widths = [20, 55, 16, 34, 11, 13, 16, 20, 30, 40]
     for i, wid in enumerate(widths, start=1):
         ws.column_dimensions[chr(64 + i)].width = wid
-    for r in range(2, ws.max_row + 1):
-        ws.cell(row=r, column=3).number_format = 'R$ #,##0.00'
-        ws.cell(row=r, column=2).alignment = Alignment(wrap_text=True,
-                                                       vertical="top")
+    for row in range(2, ws.max_row + 1):
+        ws.cell(row=row, column=3).number_format = 'R$ #,##0.00'
+        ws.cell(row=row, column=2).alignment = Alignment(wrap_text=True,
+                                                         vertical="top")
     ws.freeze_panes = "A2"
+
+
+def gera_planilha_saida(saida):
+    wb = Workbook()
+    ws0 = wb.active
+    ws0.title = "Alertas"
+    _monta_aba(ws0, saida["Alertas"])
+    for b in BUCKETS[1:]:
+        ws = wb.create_sheet(b)
+        _monta_aba(ws, saida[b])
     nome = dt.datetime.now().strftime("saida_licitacoes_%Y%m%d_%H%M%S.xlsx")
     caminho = os.path.join(BASE_DIR, nome)
     wb.save(caminho)
@@ -488,28 +489,21 @@ def gera_planilha_saida(alertas):
 
 
 # ======================================================================
-# NOTIFICACAO NO TEAMS
+# NOTIFICACAO NO TEAMS (apenas itens da aba Alertas)
 # ======================================================================
-def envia_teams(gerencia, c, s_obj, vflag, ref_linha, motivo="objeto/valor"):
+def envia_teams(gerencia, r):
     url = WEBHOOKS.get(gerencia, "")
     if not url or url.startswith("COLE_"):
         print(f"[AVISO] Webhook de {gerencia} nao configurado; alerta nao enviado.")
         return False
-    link = f"https://pncp.gov.br/app/editais/{c.get('id_pncp','')}"
-    obs_val = ("valor nao informado" if vflag is None
-               else (f"dentro de +-{int(TOLERANCIA_VALOR*100)}%" if vflag
-                     else "fora da faixa"))
-    motivo_txt = {"objeto+valor": "objeto E valor",
-                  "objeto": "objeto similar",
-                  "valor": "valor proximo"}.get(motivo, motivo)
+    link = f"https://pncp.gov.br/app/editais/{r['id_pncp']}"
     facts = [
         {"title": "Possivel", "value": "retomada/republicacao (avaliar)"},
-        {"title": "Disparado por", "value": motivo_txt},
-        {"title": "Alvo (planilha)", "value": f"linha {ref_linha}"},
-        {"title": "Ente", "value": f"{c.get('orgao','-')} ({c.get('municipio','-')})"},
-        {"title": "Objeto (similaridade)", "value": f"{s_obj:.0%}"},
-        {"title": "Valor", "value": f"R$ {c.get('valor',0):,.2f} ({obs_val})"},
-        {"title": "Situacao", "value": c.get("situacao", "-")},
+        {"title": "Alvo (planilha)", "value": f"linha {r['linha']}"},
+        {"title": "Municipio", "value": r.get("municipio", "-")},
+        {"title": "Objeto (similaridade)", "value": f"{r['s_obj']:.0%}"},
+        {"title": "Valor", "value": f"R$ {r.get('valor',0):,.2f} ({r['obs']})"},
+        {"title": "Situacao", "value": r.get("situacao", "-")},
         {"title": "Gerencia", "value": f"{gerencia} - {GERENTES.get(gerencia,'')}"},
     ]
     card = {"type": "message", "attachments": [{
@@ -521,38 +515,18 @@ def envia_teams(gerencia, c, s_obj, vflag, ref_linha, motivo="objeto/valor"):
                  "color": "Warning",
                  "text": "Possivel retomada/republicacao de edital monitorado",
                  "wrap": True},
-                {"type": "TextBlock", "text": c.get("objeto", "")[:280],
+                {"type": "TextBlock", "text": (r.get("objeto") or "")[:280],
                  "wrap": True, "spacing": "Small"},
                 {"type": "FactSet", "facts": facts}],
             "actions": [{"type": "Action.OpenUrl", "title": "Abrir no PNCP",
                          "url": link}]}}]}
     try:
-        r = requests.post(url, json=card, timeout=30)
-        ok = r.status_code in (200, 202)
-        print(f"  -> Teams[{gerencia}] {'enviado' if ok else 'falhou'} (HTTP {r.status_code})")
+        resp = requests.post(url, json=card, timeout=30)
+        ok = resp.status_code in (200, 202)
+        print(f"  -> Teams[{gerencia}] {'enviado' if ok else 'falhou'} (HTTP {resp.status_code})")
         return ok
     except requests.RequestException as e:
         print(f"  ! erro Teams: {e}"); return False
-
-
-def notifica(alertas):
-    if not alertas:
-        print(">> Nenhum edital do PNCP bateu com os alvos (municipio + objeto/valor).")
-        return
-    print(f"\n===== {len(alertas)} POSSIVEL(IS) MATCH(ES) - avaliar =====")
-    for a in alertas:
-        print(f"[MATCH] {a['det']}")
-
-    if webhook_configurado():
-        print("\nEnviando alertas ao Teams...")
-        for a in alertas:
-            envia_teams(a["w"]["gerencia"], a["c"], a["s_obj"],
-                        a["vflag"], a["w"]["id"], a.get("motivo", "objeto/valor"))
-    else:
-        caminho = gera_planilha_saida(alertas)
-        print("\n[SEM webhook] Planilha de saida gerada para analise "
-              "(verdadeiro x falso positivo):")
-        print(f"   {caminho}")
 
 
 # ======================================================================
@@ -561,14 +535,15 @@ def notifica(alertas):
 def executar_monitoramento():
     hoje = dt.date.today()
     marca = "" if eh_dia_util(hoje) else "  (atencao: hoje nao e dia util BR/PR)"
-    print("=" * 62)
+    print("=" * 66)
     print(" MONITOR DE EDITAIS - PNCP (Parana)  [busca direta / por IBGE]")
     print(f" Execucao: {hoje:%d/%m/%Y}{marca}")
     print(f" Janela consultada: {(hoje - dt.timedelta(days=JANELA_DIAS)):%d/%m/%Y}"
           f" ate {hoje:%d/%m/%Y}")
-    print(f" Criterio: mesmo MUNICIPIO E ( objeto >= {int(LIMIAR_OBJETO*100)}%"
-          f"  OU  valor +-{int(TOLERANCIA_VALOR*100)}% )")
-    print("=" * 62)
+    print(f" Criterio ALERTA: mesmo MUNICIPIO E objeto >= {int(LIMIAR_OBJETO*100)}%"
+          f" E valor +-{int(TOLERANCIA_VALOR*100)}% (nao suspensa/revogada)")
+    print(" Precedencia: Objeto -> Valor -> Suspensa -> Revogada -> Alertas")
+    print("=" * 66)
 
     watchlist = carrega_watchlist()
     if not watchlist:
@@ -580,9 +555,24 @@ def executar_monitoramento():
     todos = coleta_todos(watchlist, ini, hoje)
     print(f"Registros coletados do PNCP: {len(todos)}")
 
-    alertas = detecta(todos, watchlist)
-    relatorio_watchlist(watchlist, todos)
-    notifica(alertas)
+    saida = classifica_tudo(todos, watchlist)
+
+    print("\n----- RESUMO POR ABA -----")
+    for b in BUCKETS:
+        print(f"  {b:<12}: {len(saida[b])}")
+    print("--------------------------")
+
+    caminho = gera_planilha_saida(saida)
+    print(f"\nPlanilha de saida gerada (5 abas):\n   {caminho}")
+
+    if webhook_configurado():
+        if saida["Alertas"]:
+            print("\nEnviando itens da aba 'Alertas' ao Teams...")
+            for r in saida["Alertas"]:
+                envia_teams(r["gerencia"], r)
+        else:
+            print("\nNenhum item em 'Alertas' para enviar ao Teams.")
+
     print("\nConcluido.")
 
 
@@ -592,11 +582,10 @@ def cmd_run(args):
 
 def cmd_testalert(args):
     g = norm_gerencia(args.gerencia or "INFRA")
-    demo = {"id_pncp": "TESTE-0000", "orgao": "MUNICIPIO DE EXEMPLO",
-            "municipio": "Curitiba", "valor": 1234567.89,
-            "situacao": "Divulgada no PNCP",
-            "objeto": "Teste de alerta do monitor de editais (PNCP)."}
-    envia_teams(g, demo, 0.95, True, 0)
+    demo = {"id_pncp": "TESTE-0000", "municipio": "Curitiba", "valor": 1234567.89,
+            "situacao": "Divulgada no PNCP", "linha": 0, "s_obj": 0.95,
+            "obs": "teste", "objeto": "Teste de alerta do monitor (PNCP)."}
+    envia_teams(g, demo)
 
 
 def _pausa_se_dois_cliques():
@@ -617,7 +606,7 @@ def main():
         _pausa_se_dois_cliques()
         return
 
-    p = argparse.ArgumentParser(description="Monitor de editais PNCP (PR) - busca direta por IBGE.")
+    p = argparse.ArgumentParser(description="Monitor de editais PNCP (PR) - v10.")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("list", help="listar a watchlist").set_defaults(func=cmd_list)
     rn = sub.add_parser("run", help="rodar varredura (ultimos 7 dias)")
